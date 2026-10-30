@@ -839,6 +839,10 @@ fn decrementPP(side: *Side, mslot: u4, auto: bool) void {
 }
 
 fn incrementPP(side: *Side, player: Player, mslot: u4, options: anytype) void {
+    // In single player an AI trainer's PP never changes, so there is nothing to give back
+    if (comptime singlePlayer(@TypeOf(options))) {
+        if (options.trainer.ai(player)) return;
+    }
     var active = &side.active;
     const volatiles = &active.volatiles;
 

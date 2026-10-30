@@ -61,9 +61,9 @@ fn weedle(class: u8, team: []const Pokemon, n: u32) !u32 {
             const c2: Choice = switch (result.p2) {
                 .Pass => .{},
                 .Switch => .{ .type = .Switch, .data = @intCast(mechanics.trainerReplacement(battle.side(.P2))) },
-                .Move => if (battle.choices(.P2, .Move, &buf) == 1) buf[0] else .{
-                    .type = .Move,
-                    .data = mechanics.trainerMove(&battle, .P2, &sp.p2),
+                .Move => move: {
+                    for (buf[0..battle.choices(.P2, .Move, &buf)]) |c| if (c.type == .Move and c.data == 0) break :move c;
+                    break :move .{ .type = .Move, .data = mechanics.trainerMove(&battle, .P2, &sp.p2) };
                 },
             };
             result = try battle.update(c1, c2, &options);
@@ -131,9 +131,9 @@ fn aiChoice(battle: anytype, player: common.Player, request: Choice.Type, sp: *S
     return switch (request) {
         .Pass => .{},
         .Switch => .{ .type = .Switch, .data = @intCast(mechanics.trainerReplacement(battle.side(player))) },
-        .Move => if (battle.choices(player, .Move, &buf) == 1) buf[0] else .{
-            .type = .Move,
-            .data = mechanics.trainerMove(battle, player, sp.get(player)),
+        .Move => move: {
+            for (buf[0..battle.choices(player, .Move, &buf)]) |c| if (c.type == .Move and c.data == 0) break :move c;
+            break :move .{ .type = .Move, .data = mechanics.trainerMove(battle, player, sp.get(player)) };
         },
     };
 }
