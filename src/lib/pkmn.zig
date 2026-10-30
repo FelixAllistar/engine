@@ -103,6 +103,18 @@ pub const gen1 = struct {
     pub const Effectiveness = data.Effectiveness;
     /// Representation of a Generation I Pokémon's determinant values.
     pub const DVs = data.DVs;
+    /// Battles against the cartridge trainer AI (cartridge mode only): pass a `SinglePlayer` as `options.trainer`.
+    pub const single_player = struct {
+        const mechanics = @import("gen1/mechanics.zig");
+        /// The state of in-game trainer battles that `Battle` does not hold.
+        pub const SinglePlayer = mechanics.SinglePlayer;
+        /// One AI trainer.
+        pub const Trainer = mechanics.Trainer;
+        /// The move slot an AI trainer picks when it has a free choice.
+        pub const trainerMove = mechanics.trainerMove;
+        /// The slot an AI trainer sends out when its active Pokemon faints.
+        pub const trainerReplacement = mechanics.trainerReplacement;
+    };
 
     /// Tracks chance actions and their associated probability during a
     /// Generation I battle update when `options.chance` is enabled.
