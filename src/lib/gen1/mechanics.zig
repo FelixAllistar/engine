@@ -232,9 +232,10 @@ fn switchIn(battle: anytype, player: Player, slot: u8, initial: bool, options: a
     assert(slot != 1 or initial);
 
     if (comptime singlePlayer(@TypeOf(options))) {
-        if (player == .P2) {
-            options.trainer.uses = 0xFF;
-            if (!initial and side.stored().hp == 0) options.trainer.actions = 0;
+        if (options.trainer.ai(player)) {
+            const t = options.trainer.get(player);
+            t.uses = 0xFF;
+            if (!initial and side.stored().hp == 0) t.actions = 0;
         }
     }
 
@@ -256,7 +257,7 @@ fn switchIn(battle: anytype, player: Player, slot: u8, initial: bool, options: a
 
     statusModify(incoming.status, &active.stats);
     if (comptime singlePlayer(@TypeOf(options))) {
-        if (player == .P1) badgeBoosts(&active.stats, options.trainer.badges);
+        if (options.trainer.boosted(player)) badgeBoosts(&active.stats, options.trainer.badges);
     }
     options.chance.switched(player, slot);
 
@@ -778,7 +779,9 @@ fn canMove(
     }
 
     side.last_used_move = side.last_selected_move;
-    if (!skip_pp and !(singlePlayer(@TypeOf(options)) and player == .P2)) decrementPP(side, mslot, auto);
+    // In single player only the player spends PP
+    const ai = if (comptime singlePlayer(@TypeOf(options))) options.trainer.ai(player) else false;
+    if (!skip_pp and !ai) decrementPP(side, mslot, auto);
 
     const target = if (move.target == .Self) player else player.foe();
     try options.log.move(.{ player_ident, side.last_selected_move, battle.active(target), from });
@@ -2589,7 +2592,7 @@ pub const Effects = struct {
 
         // GLITCH: in single player the badge boosts are applied again to every stat
         if (comptime singlePlayer(@TypeOf(options))) {
-            if (player == .P1) badgeBoosts(stats, options.trainer.badges);
+            if (options.trainer.boosted(player)) badgeBoosts(stats, options.trainer.badges);
         }
         // GLITCH: Stat modification errors glitch
         statusModify(battle.foe(player).stored().status, &battle.foe(player).active.stats);
@@ -2603,7 +2606,7 @@ pub const Effects = struct {
 
         // In single player the stat-down moves and effects of the trainer miss 25% of the time
         if (comptime singlePlayer(@TypeOf(options))) {
-            if (player == .P2 and battle.rng.next() < Gen12.percent(25) + 1) {
+            if (options.trainer.ai(player) and battle.rng.next() < Gen12.percent(25) + 1) {
                 if (secondary) return;
                 try log.lastmiss(.{});
                 return log.miss(.{battle.active(player)});
@@ -2709,7 +2712,7 @@ pub const Effects = struct {
 
         // GLITCH: in single player the badge boosts are applied again to every stat
         if (comptime singlePlayer(@TypeOf(options))) {
-            if (player == .P2) badgeBoosts(stats, options.trainer.badges);
+            if (options.trainer.boosted(player.foe())) badgeBoosts(stats, options.trainer.badges);
         }
         // GLITCH: Stat modification errors glitch
         statusModify(foe.stored().status, stats);
@@ -3277,22 +3280,46 @@ pub fn choices(battle: anytype, player: Player, request: Choice.Type, out: []Cho
     return n;
 }
 
-// Single player: battles against the cartridge's trainer AI (P1 = the player, P2 = the AI trainer), as opposed to
-// the link battles everything above models. Enabled by an `options` struct that also has a `trainer: *Trainer` field;
-// with the usual options none of this is compiled. Reference: pret/pokered engine/battle/{core,effects,trainer_ai}.asm.
+// Single player: battles against the cartridge's trainer AI, as opposed to the link battles everything above models.
+// P2 is an AI trainer; P1 is the player or, in mirror mode, a second AI trainer under the same enemy rules (as in a
+// trainer-vs-trainer tournament). Enabled by an `options` struct that also has a `trainer: *SinglePlayer` field; with
+// the usual options none of this is compiled. Reference: pret/pokered engine/battle/{core,effects,trainer_ai}.asm.
 
 const trainer = @import("data/trainer.zig");
 
-/// The part of an in-game trainer battle that `Battle` does not hold.
+/// One AI trainer's state that `Battle` does not hold.
 pub const Trainer = struct {
     /// The trainer class (trainer_constants.asm, 1-based).
-    class: u8,
-    /// The player's badges (wObtainedBadges: bit 0 Boulder ... bit 7 Earth).
-    badges: u8 = 0,
-    /// Item uses left for the active enemy Pokémon (wAICount); 0xFF reloads from the class on the next AI call.
+    class: u8 = 0,
+    /// Item uses left for the active Pokémon (wAICount); 0xFF reloads from the class on the next AI call.
     uses: u8 = 0xFF,
-    /// Enemy moves since the last fainted enemy was replaced (wAILayer2Encouragement).
+    /// Moves since the last fainted Pokémon was replaced (wAILayer2Encouragement).
     actions: u8 = 0,
+};
+
+pub const SinglePlayer = struct {
+    /// P1's trainer, used only in mirror mode.
+    p1: Trainer = .{},
+    /// P2's trainer.
+    p2: Trainer,
+    /// The player's badges (wObtainedBadges: bit 0 Boulder ... bit 7 Earth); unused in mirror mode.
+    badges: u8 = 0,
+    /// P1 is a second AI trainer: no badges, no PP use, the trainer AI, items and the 25% stat-down miss.
+    mirror: bool = false,
+
+    /// Whether `player` is played by the trainer AI under the enemy rules.
+    pub fn ai(self: *const SinglePlayer, player: Player) bool {
+        return player == .P2 or self.mirror;
+    }
+
+    pub fn get(self: *SinglePlayer, player: Player) *Trainer {
+        return if (player == .P1) &self.p1 else &self.p2;
+    }
+
+    /// Whether `player` gets the player's badge boosts.
+    fn boosted(self: *const SinglePlayer, player: Player) bool {
+        return player == .P1 and !self.mirror;
+    }
 };
 
 fn singlePlayer(comptime Options: type) bool {
@@ -3308,8 +3335,8 @@ fn badgeBoosts(stats: *Stats(u16), badges: u8) void {
     }
 }
 
-/// The enemy's turn slot: TrainerAI may use an item or switch instead of the chosen move, which is then skipped (its
-/// residual damage still applies). Every move the enemy does execute counts for the second move-choice layer.
+/// An AI trainer's turn slot: TrainerAI may use an item or switch instead of the chosen move, which is then skipped
+/// (its residual damage still applies). Every move it does execute counts for the second move-choice layer.
 fn act(
     battle: anytype,
     player: Player,
@@ -3320,96 +3347,101 @@ fn act(
     options: anytype,
 ) !?Result {
     if (comptime singlePlayer(@TypeOf(options))) {
-        if (player == .P2 and choice.type == .Move) {
-            if (try trainerAI(battle, options)) return null;
-            if (!battle.side(.P1).active.volatiles.Binding) options.trainer.actions +|= 1;
+        if (options.trainer.ai(player) and choice.type == .Move) {
+            if (try trainerAI(battle, player, options)) return null;
+            if (!battle.foe(player).active.volatiles.Binding) options.trainer.get(player).actions +|= 1;
         }
     }
     return executeMove(battle, player, choice, rewrap, skip, residual, options);
 }
 
 /// TrainerAI: one random byte, then the class routine. True if it used an item or switched.
-fn trainerAI(battle: anytype, options: anytype) !bool {
-    const t = options.trainer;
+fn trainerAI(battle: anytype, player: Player, options: anytype) !bool {
+    const t = options.trainer.get(player);
     if (t.uses == 0) return false;
     const class = trainer.CLASSES[t.class - 1];
     if (t.uses == 0xFF) t.uses = class.uses;
     const r = battle.rng.next();
-    const pokemon = battle.side(.P2).stored();
+    const pokemon = battle.side(player).stored();
     const below = struct {
         fn f(p: *const data.Pokemon, n: u16) bool {
             return p.hp < p.stats.hp / n;
         }
     }.f;
+    const p25 = Gen12.percent(25) + 1;
+    const p50 = Gen12.percent(50) + 1;
+    const p13 = Gen12.percent(13) - 1;
     return switch (class.routine) {
         .None => false,
-        .Juggler => r < Gen12.percent(25) + 1 and try aiSwitch(battle, options),
-        .Blackbelt, .CooltrainerM, .Koga => r < Gen12.percent(13) - 1 and class.routine == .Blackbelt and
-            try aiBoost(battle, .Meditate, options) or
-            r < Gen12.percent(25) + 1 and class.routine != .Blackbelt and try aiBoost(battle, .Meditate, options),
-        .Giovanni => r < Gen12.percent(25) + 1 and aiGuardSpec(battle, options),
+        .Juggler => r < p25 and try aiSwitch(battle, player, options),
+        .Blackbelt => r < p13 and try aiBoost(battle, player, .Meditate, options),
+        .CooltrainerM, .Koga => r < p25 and try aiBoost(battle, player, .Meditate, options),
+        .Giovanni => r < p25 and aiGuardSpec(battle, player, options),
         // GLITCH: the 25% check is skipped, so this runs every turn
-        .CooltrainerF => if (below(pokemon, 10)) aiHeal(battle, 200, options) else below(pokemon, 5) and
-            try aiSwitch(battle, options),
-        .Brock => pokemon.status != 0 and aiCure(battle, options),
-        .Misty, .Bruno => r < Gen12.percent(25) + 1 and try aiBoost(battle, .Harden, options),
-        .LtSurge => r < Gen12.percent(25) + 1 and try aiXSpeed(battle, options),
-        .Erika => r < Gen12.percent(50) + 1 and below(pokemon, 10) and aiHeal(battle, 50, options),
-        .Blaine => r < Gen12.percent(25) + 1 and aiHeal(battle, 50, options),
-        .Sabrina => r < Gen12.percent(25) + 1 and below(pokemon, 10) and aiHeal(battle, 200, options),
-        .Rival2 => r < Gen12.percent(13) - 1 and below(pokemon, 5) and aiHeal(battle, 20, options),
-        .Rival3 => r < Gen12.percent(13) - 1 and below(pokemon, 5) and aiFullRestore(battle, options),
-        .Lorelei => r < Gen12.percent(50) + 1 and below(pokemon, 5) and aiHeal(battle, 50, options),
-        .Agatha => if (r < Gen12.percent(8)) try aiSwitch(battle, options) else r < Gen12.percent(50) + 1 and
-            below(pokemon, 4) and aiHeal(battle, 50, options),
-        .Lance => r < Gen12.percent(50) + 1 and below(pokemon, 5) and aiHeal(battle, 200, options),
+        .CooltrainerF => if (below(pokemon, 10)) aiHeal(battle, player, 200, options) else below(pokemon, 5) and
+            try aiSwitch(battle, player, options),
+        .Brock => pokemon.status != 0 and aiCure(battle, player, options),
+        .Misty, .Bruno => r < p25 and try aiBoost(battle, player, .Harden, options),
+        .LtSurge => r < p25 and try aiXSpeed(battle, player, options),
+        .Erika => r < p50 and below(pokemon, 10) and aiHeal(battle, player, 50, options),
+        .Blaine => r < p25 and aiHeal(battle, player, 50, options),
+        .Sabrina => r < p25 and below(pokemon, 10) and aiHeal(battle, player, 200, options),
+        .Rival2 => r < p13 and below(pokemon, 5) and aiHeal(battle, player, 20, options),
+        .Rival3 => r < p13 and below(pokemon, 5) and aiFullRestore(battle, player, options),
+        .Lorelei => r < p50 and below(pokemon, 5) and aiHeal(battle, player, 50, options),
+        .Agatha => if (r < Gen12.percent(8)) try aiSwitch(battle, player, options) else r < p50 and
+            below(pokemon, 4) and aiHeal(battle, player, 50, options),
+        .Lance => r < p50 and below(pokemon, 5) and aiHeal(battle, player, 200, options),
     };
 }
 
 /// AIRecoverHP (Potion 20, Super Potion 50, Hyper Potion 200), capped at the maximum.
-fn aiHeal(battle: anytype, amount: u16, options: anytype) bool {
-    const pokemon = battle.side(.P2).stored();
+fn aiHeal(battle: anytype, player: Player, amount: u16, options: anytype) bool {
+    const pokemon = battle.side(player).stored();
     pokemon.hp = @min(pokemon.stats.hp, pokemon.hp + amount);
-    options.trainer.uses -= 1;
+    options.trainer.get(player).uses -= 1;
     return true;
 }
 
 /// AICureStatus (Full Heal): clears the status and Toxic, not confusion; paralysis and burn stat penalties stay.
-fn aiCure(battle: anytype, options: anytype) bool {
-    const side = battle.side(.P2);
+fn aiCure(battle: anytype, player: Player, options: anytype) bool {
+    const side = battle.side(player);
     side.stored().status = 0;
     side.active.volatiles.Toxic = false;
-    options.trainer.uses -= 1;
+    options.trainer.get(player).uses -= 1;
     return true;
 }
 
-fn aiFullRestore(battle: anytype, options: anytype) bool {
-    const pokemon = battle.side(.P2).stored();
+fn aiFullRestore(battle: anytype, player: Player, options: anytype) bool {
+    const pokemon = battle.side(player).stored();
     pokemon.hp = pokemon.stats.hp;
-    return aiCure(battle, options);
+    return aiCure(battle, player, options);
 }
 
-fn aiGuardSpec(battle: anytype, options: anytype) bool {
-    battle.side(.P2).active.volatiles.Mist = true;
-    options.trainer.uses -= 1;
+fn aiGuardSpec(battle: anytype, player: Player, options: anytype) bool {
+    battle.side(player).active.volatiles.Mist = true;
+    options.trainer.get(player).uses -= 1;
     return true;
 }
 
-/// X Attack and X Defend: the enemy's stat-up move effect (Meditate, Harden).
-fn aiBoost(battle: anytype, move: Move, options: anytype) !bool {
-    try Effects.boost(battle, .P2, Move.get(move), options);
-    options.trainer.uses -= 1;
+/// X Attack and X Defend: the stat-up move effect (Meditate, Harden).
+fn aiBoost(battle: anytype, player: Player, move: Move, options: anytype) !bool {
+    try Effects.boost(battle, player, Move.get(move), options);
+    options.trainer.get(player).uses -= 1;
     return true;
 }
 
 /// X Speed: SPEED_UP1_EFFECT, which no move has, so Effects.boost has no branch for it.
-fn aiXSpeed(battle: anytype, options: anytype) !bool {
-    options.trainer.uses -= 1;
-    const side = battle.side(.P2);
-    const ident = battle.active(.P2);
+fn aiXSpeed(battle: anytype, player: Player, options: anytype) !bool {
+    options.trainer.get(player).uses -= 1;
+    const side = battle.side(player);
+    const ident = battle.active(player);
     const boosts = &side.active.boosts;
     const stats = &side.active.stats;
-    if (boosts.spe == 6) return try options.log.fail(.{ ident, .None }) == {};
+    if (boosts.spe == 6) {
+        try options.log.fail(.{ ident, .None });
+        return true;
+    }
     boosts.spe = @intCast(@as(i8, boosts.spe) + 1);
     if (stats.spe == MAX_STAT_VALUE) {
         boosts.spe -= 1;
@@ -3420,20 +3452,20 @@ fn aiXSpeed(battle: anytype, options: anytype) !bool {
     stats.spe = @min(MAX_STAT_VALUE, unmodifiedStats(battle, side).spe * mod[0] / mod[1]);
     try options.log.boost(.{ ident, .Speed, 1 });
     // GLITCH: Stat modification errors glitch
-    statusModify(battle.side(.P1).stored().status, &battle.side(.P1).active.stats);
+    statusModify(battle.foe(player).stored().status, &battle.foe(player).active.stats);
     return true;
 }
 
 /// AISwitchIfEnoughMons: switches if two or more of the party (the active one included) have HP left.
-fn aiSwitch(battle: anytype, options: anytype) !bool {
+fn aiSwitch(battle: anytype, player: Player, options: anytype) !bool {
     var alive: u8 = 0;
-    for (battle.side(.P2).pokemon) |p| alive += @intFromBool(p.hp > 0);
+    for (battle.side(player).pokemon) |p| alive += @intFromBool(p.hp > 0);
     if (alive < 2) return false;
-    try switchIn(battle, .P2, trainerReplacement(battle.side(.P2)), false, options);
+    try switchIn(battle, player, trainerReplacement(battle.side(player)), false, options);
     return true;
 }
 
-/// EnemySendOut: the slot of the first Pokémon in party order that is not the active one and has HP left. Also the
+/// EnemySendOut: the slot of the first Pokémon in party order that is not the active one and has HP left. Also an AI
 /// trainer's choice when its active Pokémon faints.
 pub fn trainerReplacement(side: *const Side) u8 {
     for (side.pokemon, 1..) |p, id| {
@@ -3443,12 +3475,12 @@ pub fn trainerReplacement(side: *const Side) u8 {
     unreachable;
 }
 
-/// SelectEnemyMove with AIEnemyTrainerChooseMoves: the enemy's move slot (1-4) when it has a free choice. Every move
-/// scores 10 (a disabled one 80), the class's layers adjust the scores, the moves at the minimum score stay, and one
-/// random byte picks slot 1 (< 63), 2 (< 127), 3 (< 190) or 4, rerolled while that slot is empty or disabled.
-pub fn trainerMove(battle: anytype, t: *const Trainer) u4 {
-    const side = battle.side(.P2);
-    const player = battle.side(.P1);
+/// SelectEnemyMove with AIEnemyTrainerChooseMoves: an AI trainer's move slot (1-4) when it has a free choice. Every
+/// move scores 10 (a disabled one 80), the class's layers adjust the scores, the moves at the minimum score stay, and
+/// one random byte picks slot 1 (< 63), 2 (< 127), 3 (< 190) or 4, rerolled while that slot is empty or disabled.
+pub fn trainerMove(battle: anytype, player: Player, t: *const Trainer) u4 {
+    const side = battle.side(player);
+    const foe = battle.foe(player);
     const moves = &side.active.moves;
     const disabled_slot = side.active.volatiles.disable_move;
     var score = [_]u8{10} ** 4;
@@ -3459,17 +3491,17 @@ pub fn trainerMove(battle: anytype, t: *const Trainer) u4 {
         const id = @intFromEnum(m.id);
         const effect = trainer.EFFECTS[id];
         const power = trainer.POWERS[id];
-        // 1: heavily discourage status-only moves when the player already has a status
-        if (layers & 1 != 0 and player.stored().status != 0 and power == 0 and
+        // 1: heavily discourage status-only moves when the foe already has a status
+        if (layers & 1 != 0 and foe.stored().status != 0 and power == 0 and
             (effect == trainer.EFFECT_01 or effect == trainer.SLEEP_EFFECT or
                 effect == trainer.POISON_EFFECT or effect == trainer.PARALYZE_EFFECT)) score[i] += 5;
-        // 2: on the enemy's second move since a send-out, slightly encourage stat-changing moves
+        // 2: on the second move since a send-out, slightly encourage stat-changing moves
         if (layers & 2 != 0 and t.actions == 1 and
             (effect >= trainer.ATTACK_UP1_EFFECT and effect < trainer.BIDE_EFFECT or
                 effect >= trainer.ATTACK_UP2_EFFECT and effect < trainer.POISON_EFFECT)) score[i] -= 1;
         // 3: encourage super effective moves, discourage weaker ones if something better exists
         if (layers & 4 != 0) {
-            const e = aiEffectiveness(trainer.TYPES[id], player.active.types);
+            const e = aiEffectiveness(trainer.TYPES[id], foe.active.types);
             if (e > 16) score[i] -= 1 else if (e < 16 and betterMove(moves, trainer.TYPES[id])) score[i] += 1;
         }
     }
@@ -3483,7 +3515,8 @@ pub fn trainerMove(battle: anytype, t: *const Trainer) u4 {
     }
     while (true) {
         const r = battle.rng.next();
-        const slot: u4 = if (r < Gen12.percent(25)) 1 else if (r < Gen12.percent(50)) 2 else if (r < Gen12.percent(75) - 1) 3 else 4;
+        const slot: u4 =
+            if (r < Gen12.percent(25)) 1 else if (r < Gen12.percent(50)) 2 else if (r < Gen12.percent(75) - 1) 3 else 4;
         if (slot != disabled_slot and moves[slot - 1].id != .None and keep[slot - 1]) return slot;
     }
 }
